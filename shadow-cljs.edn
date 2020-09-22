@@ -1,0 +1,15 @@
+{:deps {:aliases [:shadow-cljs]}
+ :http {:host "localhost"}
+ :ssl {:keystore "ssl/keystore.jks"
+       :password "changeit"}
+ :builds {:app {:target :browser
+                :output-dir "classes/public/js/"
+                :asset-path "/js"
+                :dev {:compiler-options {:external-config {:guardrails {}}}}
+                ;; This is necessary because there is something with the monday-api-sdk stolen from: https://github.com/thheller/shadow-cljs/issues/611
+                :compiler-options {:cross-chunk-method-motion false}
+                :devtools   {:after-load avisi-apps.client.current-app/refresh!
+                             :devtools-url "https://localhost:9630"
+                             :preloads   [com.fulcrologic.fulcro.inspect.preload]}
+                :modules {:board-view {:entries [avisi-apps.feature.board-view.main]
+                                       :init-fn avisi-apps.feature.board-view.main/init}}}}}

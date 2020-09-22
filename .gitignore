@@ -1,0 +1,10 @@
+config.edn
+target/
+.nrepl-port
+*.iml
+node_modules
+.shadow-cljs
+.idea
+.cpcache
+ssl
+classes

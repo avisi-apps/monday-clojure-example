@@ -1,0 +1,3 @@
+;; Copy this file to config.edn and replace the string values for actual values
+{:monday/client-id "<< client-id >>"
+ :monday/client-secret "<< client-secret >>"}
