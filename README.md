@@ -7,6 +7,10 @@
 * [Clojure](https://clojure.org/guides/getting_started)
 * [mkcert](https://mkcert.dev/)
 
+### Config
+
+Copy `config.example.edn` to `config.edn` and configure your oauth credentials from your monday app
+
 ### Running everything
 
 Make sure to first generate a cert with:
