@@ -10,12 +10,53 @@
             [clojure.tools.logging :as log]
             [muuntaja.core :as m]
             [malli.util :as mu]
-            [clojure.spec.alpha :as s]))
+            [clojure.spec.alpha :as s]
+            [mount.core :refer [defstate]]
+            [jsonista.core :as json]
+            [com.wsscode.pathom.graphql :refer [query->graphql]]
+            [clj-http.client :as http]
+            [clojure.string :as string])
+  (:import (org.eclipse.jetty.server Server)))
+
+(defn monday-query [query]
+  (let [{:keys [body status]}
+        (http/post
+          "https://api.monday.com/v2"
+          {:oauth-token (:monday/api-token (read-config "config.edn"))
+           :content-type :json
+           :form-params {:query (query->graphql query)}})]
+    {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
+     :status status}))
 
 (defn handle-integration [payload]
-  (log/info "Got payload" payload)
+  ;(log/info "Got payload" payload)
   {:status 200
    :body {:result "done"}})
+
+(defn handle-text-transformer [payload]
+  (let [{:keys [inputFields]} payload
+        {:keys [sourceColumnId boardId targetColumnId itemId]} inputFields]
+    (def _payload payload)
+    (let [source-column (-> (monday-query [(list {:items [:id :name
+                                                          (list {:column_values [:text]}
+                                                            {:ids sourceColumnId})]}
+                                             {:ids [itemId]})])
+                          :body
+                          :data
+                          :items
+                          first
+                          :column_values
+                          first
+                          :text)
+          {:keys [body status]}
+          (monday-query [{(list 'change_column_value
+                              {:item_id itemId
+                               :column_id targetColumnId
+                               :board_id boardId
+                               :value (json/write-value-as-string (string/upper-case source-column))})
+                            [:id]}])]
+      {:status status
+       :body {:result "done"}})))
 
 (def monday-authentication-middleware
   {:name ::monday-authentication
@@ -27,7 +68,11 @@
                     (assoc request :jwt
                            (jwt/unsign
                              (get (:headers request) "authorization")
-                             (:monday/client-secret route-data)))))))})
+                             (:monday/signing-secret route-data)))))))})
+
+(comment
+  (re-find)
+  )
 
 (def app
   (ring/ring-handler
@@ -36,9 +81,13 @@
       [["/integrations"
         ["/action"
          {:middleware [[monday-authentication-middleware]]}
-         ["/create-page" {:post {:parameters {:body [:map #_[:payload
-                                                           [:map [:inboundFieldValues
-                                                                  [:map [:itemId string?]]]]]]}
+         ["/text-transformer"
+          {:post {:parameters {:body [:map]}
+                  :responses {200 {:body [:map]}}
+                  :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                             (def _request request)
+                             (handle-text-transformer payload))}}]
+         ["/create-page" {:post {:parameters {:body [:map]}
                                  :responses {200 {:body [:map [:result string?]]}}
                                  :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
                                             (def _request request)
@@ -71,19 +120,35 @@
       (ring/create-resource-handler {:path "/"})
       (ring/create-default-handler))))
 
-(defn start []
-  (jetty/run-jetty #'app {:port 3000, :join? false})
-  (println "server running in port 3000"))
+(defstate server
+  :start (do
+           (println "Server starting on port 3000")
+           (jetty/run-jetty #'app {:port 3000, :join? false}))
+  :stop (.stop ^Server server))
 
 (comment
   (start)
 
   (jwt/unsign
     (get (:headers _request) "authorization")
-    (:monday/client-secret (read-config "config.edn")))
+    (:monday/signing-secret (read-config "config.edn")))
 
-  _request
+  ;api.monday.com/v2
 
+  (monday-query [(list {:items [:id :name
+                                (list {:column_values [:id]}
+                                  {:ids "text"})]}
+                   {:ids [749796988]})])
+
+  (monday-query [(list {:items [:id :name]}
+                   {:ids [749796988]})])
+
+  (monday-query [{(list 'change_column_value
+                    {:item_id 749796988
+                     :column_id "text2"
+                     :board_id 749796977
+                     :value (json/write-value-as-string "This update will be added to the item")})
+                  [:id]}])
 
   )
 
