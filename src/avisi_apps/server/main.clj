@@ -92,46 +92,46 @@
 
 (defn handle-text-transformer [payload]
   (let [{:keys [inputFields]} payload
-        {:keys [sourceColumnId boardId targetColumnId itemId]} inputFields]
-    (let [source-column (-> (monday-query [(list {:items [:id :name
-                                                          (list {:column_values [:text]}
-                                                            {:ids sourceColumnId})]}
-                                             {:ids [itemId]})])
-                          :body
-                          :data
-                          :items
-                          first
-                          :column_values
-                          first
-                          :text)
-          {:keys [body status]}
-          (monday-query [{(list 'change_column_value
-                              {:item_id itemId
-                               :column_id targetColumnId
-                               :board_id boardId
-                               :value (json/write-value-as-string (string/upper-case source-column))})
-                            [:id]}])]
-      {:status status
-       :body {:result "done"}})))
+        {:keys [sourceColumnId boardId targetColumnId itemId]} inputFields
+        source-column (-> (monday-query [(list {:items [:id :name
+                                                        (list {:column_values [:text]}
+                                                          {:ids sourceColumnId})]}
+                                           {:ids [itemId]})])
+                        :body
+                        :data
+                        :items
+                        first
+                        :column_values
+                        first
+                        :text)
+        {:keys [body status]}
+        (monday-query [{(list 'change_column_value
+                          {:item_id itemId
+                           :column_id targetColumnId
+                           :board_id boardId
+                           :value (json/write-value-as-string (string/upper-case source-column))})
+                        [:id]}])]
+    {:status status
+     :body {:result "done"}}))
 
 (defn handle-gitlab-create-issue [{:keys [payload user-id] :as env}]
   (let [{:keys [inputFields]} payload
-        {:keys [itemId gitlabProjects]} inputFields]
-    (let [item-name (-> (monday-query [(list {:items [:name]}
-                                         {:ids [itemId]})])
-                      :body
-                      :data
-                      :items
-                      first
-                      :name)
-          {:keys [body status]} (-> (gitlab-query [{(list 'createIssue
-                                                {:input {:projectPath (:value gitlabProjects)
-                                                         :title item-name}})
-                                              [{:issue [:id]}]}]
-                                      (fetch-gitlab-access-token env))
-                            :body)]
-      {:status status
-       :body {:result "done"}})))
+        {:keys [itemId gitlabProject]} inputFields
+        item-name (-> (monday-query [(list {:items [:name]}
+                                       {:ids [itemId]})])
+                    :body
+                    :data
+                    :items
+                    first
+                    :name)
+        {:keys [body status]} (-> (gitlab-query [{(list 'createIssue
+                                                    {:input {:projectPath (:value gitlabProject)
+                                                             :title item-name}})
+                                                  [{:issue [:id]}]}]
+                                    (fetch-gitlab-access-token env))
+                                :body)]
+    {:status status
+     :body {:result "done"}}))
 
 (def monday-authentication-middleware
   {:name ::monday-authentication
