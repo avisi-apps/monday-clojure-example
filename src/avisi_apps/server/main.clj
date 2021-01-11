@@ -60,22 +60,21 @@
   {:status 302
    :headers {"location" location}})
 
-(defn monday-query [query]
+(defn monday-query [query access-token]
   (let [{:keys [body status]}
         (http/post
           "https://api.monday.com/v2"
-          {:oauth-token (:monday/api-token app-config)
-           ;:oauth-token (get-in _request [:jwt :shortLivedToken])
+          {:oauth-token access-token
            :content-type :json
            :form-params {:query (query->graphql query)}})]
     {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
      :status status}))
 
-(defn gitlab-query [query oauth-token]
+(defn gitlab-query [query access-token]
   (let [{:keys [body status]}
         (http/post
           "https://gitlab.com/api/graphql"
-          {:oauth-token oauth-token
+          {:oauth-token access-token
            :content-type :json
            :form-params {:query (query->graphql query)}})]
     {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
@@ -96,35 +95,12 @@
                                          :value fullPath})
                                   projects))}))
 
-(defn handle-text-transformer [payload]
-  (let [{:keys [inputFields]} payload
-        {:keys [sourceColumnId boardId targetColumnId itemId]} inputFields
-        source-column (-> (monday-query [(list {:items [:id :name
-                                                        (list {:column_values [:text]}
-                                                          {:ids sourceColumnId})]}
-                                           {:ids [itemId]})])
-                        :body
-                        :data
-                        :items
-                        first
-                        :column_values
-                        first
-                        :text)
-        {:keys [body status]}
-        (monday-query [{(list 'change_column_value
-                          {:item_id itemId
-                           :column_id targetColumnId
-                           :board_id boardId
-                           :value (json/write-value-as-string (string/upper-case source-column))})
-                        [:id]}])]
-    {:status status
-     :body {:result "done"}}))
-
 (defn handle-gitlab-create-issue [{:keys [payload user-id] :as env}]
   (let [{:keys [inputFields]} payload
         {:keys [itemId gitlabProject]} inputFields
         item-name (-> (monday-query [(list {:items [:name]}
-                                       {:ids [itemId]})])
+                                       {:ids [itemId]})]
+                        (fetch-gitlab-access-token env))
                     :body
                     :data
                     :items
@@ -274,55 +250,32 @@
   ;; user-id
   ;; 16227277
 
-  (str "https://gitlab.com/oauth/authorize?"
-    (http/generate-query-string
-      {:client_id (:gitlab/application-id app-config)
-       :redirect_uri "https://fatih.eu.ngrok.io/gitlab/oauth/callback"
-       :scopes "read_user+profile"
-       :response_type "code"}))
-
-  (jwt/unsign
-    ;(get (:headers _request) "authorization")
-    _token
-    (:monday/signing-secret app-config))
-
-  (let [{:keys [body status]}
-        (http/post
-          "https://gitlab.com/oauth/token"
-          {:content-type :json
-           :query-params {:client_id (:gitlab/application-id (read-config "config.edn"))
-                          :client_secret (:gitlab/secret (read-config "config.edn"))
-                          :code (get _params "code")
-                          :redirect_uri "https://fatih.eu.ngrok.io/gitlab/oauth/callback"
-                          :grant_type "authorization_code"}})]
-    {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
-     :status status})
-
   (monday-query [(list {:items [:id :name
                                 (list {:column_values [:id]}
                                   {:ids "text"})]}
-                   {:ids [749796988]})])
+                   {:ids [749796988]})]
+    (get-in @oauth-tokens [:monday 16227277 :access_token]))
 
   (monday-query [(list {:items [:id :name]}
-                   {:ids [749796988]})])
+                   {:ids [749796988]})]
+    (get-in @oauth-tokens [:monday 16227277 :access_token]))
 
   (monday-query [{(list 'change_column_value
                     {:item_id 749796988
                      :column_id "text2"
                      :board_id 749796977
                      :value (json/write-value-as-string "This update will be added to the item")})
-                  [:id]}])
-
-  _gitlab-token
+                  [:id]}]
+    (get-in @oauth-tokens [:monday 16227277 :access_token]))
 
   (gitlab-query [{:currentUser
                   [:id :name]}]
-    (:access_token _gitlab-token))
+    (get-in @oauth-tokens [:gitlab 16227277 :access_token]))
 
   (->> (gitlab-query [(list {:projects
                             [{:nodes [:fullPath]}]}
                        {:membership true})]
-        (:access_token _gitlab-token))
+         (get-in @oauth-tokens [:gitlab 16227277 :access_token]))
     :body
     :data
     :projects
@@ -333,7 +286,7 @@
                        {:input {:projectPath "fatihict/fatih-test-private-repo"
                                 :title "Clojure graphql!"}})
                       [{:issue [:id]}]}]
-        (:access_token _gitlab-token))
+        (get-in @oauth-tokens [:gitlab 16227277 :access_token]))
     :body)
 
   (query->graphql [{:currentUser
