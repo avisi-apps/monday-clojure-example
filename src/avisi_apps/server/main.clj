@@ -18,6 +18,10 @@
             [clojure.string :as string])
   (:import (org.eclipse.jetty.server Server)))
 
+(declare gitlab-query)
+
+(declare fetch-gitlab-access-token)
+
 (def base-url "https://fatih.eu.ngrok.io")
 
 (defonce oauth-tokens (atom {}))
@@ -52,6 +56,10 @@
 (defn fetch-gitlab-access-token [env]
   (:access_token (fetch-tokens (assoc env :provider :gitlab))))
 
+(defn redirect-response [location]
+  {:status 302
+   :headers {"location" location}})
+
 (defn monday-query [query]
   (let [{:keys [body status]}
         (http/post
@@ -75,21 +83,17 @@
 
 (defn handle-gitlab-projects [{:keys [payload user-id] :as env}]
   (let [{:keys [inputFields]} payload
-        projects (->> (gitlab-query [(list {:projects
+        projects (-> (gitlab-query [(list {:projects
                                             [{:nodes [:fullPath]}]}
                                        {:membership true})]
                         (fetch-gitlab-access-token env))
-                   :body
-                   :data
-                   :projects
-                   :nodes
-                   (mapv :fullPath))]
+                   (get-in [:body :data :projects :nodes]))]
     {:status 200
      :headers {"content-type" "application/json"}
      :body
-     (json/write-value-as-bytes (mapv (fn [project]
-                                        {:id project
-                                         :value project})
+     (json/write-value-as-bytes (mapv (fn [{:keys [fullPath]}]
+                                        {:id fullPath
+                                         :value fullPath})
                                   projects))}))
 
 (defn handle-text-transformer [payload]
@@ -213,30 +217,29 @@
         {:get {:handler (fn [request]
                           (let [{:keys [params]} request
                                 {:strs [token]} params
-                                redirect-url (monday-authorize-url token)
-                                _ (log/info "Redirecting to monday oauth url " redirect-url)]
-                            {:status 302
-                             :headers {"location" redirect-url}}))}}]
+                                env {:user-id (state->user-id token)}
+                                monday-authorized? (some? (fetch-monday-access-token env))
+                                gitlab-authorized? (some? (fetch-gitlab-access-token env))]
+                            (redirect-response (cond
+                                                 (and gitlab-authorized? monday-authorized?) (state->back-to-url token)
+                                                 monday-authorized? (gitlab-authorize-url token)
+                                                 :else (monday-authorize-url token)))))}}]
        ["/oauth/callback"
         {:get {:handler (fn [request]
                           (let [{:keys [params]} request
                                 {:strs [code state]} params
                                 monday-oauth-token (:body (fetch-monday-oauth-token code))
                                 _ (store-monday-oauth-tokens {:state state :token monday-oauth-token})
-                                gitlab-auth-url (gitlab-authorize-url state)
-                                _ (log/info "Redirecting to gitlab auth url " gitlab-auth-url)]
-                            {:status 302
-                             :headers {"location" gitlab-auth-url}}))}}]
+                                gitlab-auth-url (gitlab-authorize-url state)]
+                            (redirect-response gitlab-auth-url)))}}]
        ["/gitlab"
         ["/oauth/callback"
          {:get {:handler (fn [request]
                            (let [{:keys [params]} request
                                  {:strs [code state]} params
-                                 back-to-url (state->back-to-url state)
                                  gitlab-token (:body (fetch-gitlab-oauth-token code))
                                  _ (store-gitlab-oauth-tokens {:state state :token gitlab-token})]
-                             {:status 302
-                              :headers {"location" back-to-url}}))}}]]]
+                             (redirect-response (state->back-to-url state))))}}]]]
       ;; router data effecting all routes
       {:data (merge {:muuntaja m/instance
                      :coercion (reitit.coercion.malli/create
