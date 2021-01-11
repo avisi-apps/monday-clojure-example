@@ -18,11 +18,43 @@
             [clojure.string :as string])
   (:import (org.eclipse.jetty.server Server)))
 
+(defonce oauth-tokens (atom {}))
+
+(defonce app-config (read-config "config.edn"))
+
+(defn unsign-claims [state]
+  (jwt/unsign state (:monday/signing-secret app-config)))
+
+(defn state->user-id [state]
+  (:userId (unsign-claims state)))
+
+(defn state->back-to-url [state]
+  (:backToUrl (unsign-claims state)))
+
+(defn store-token [{:keys [state token provider]}]
+  (let [user-id (state->user-id state)]
+    (swap! oauth-tokens assoc-in [provider user-id] token)))
+
+(defn store-monday-oauth-tokens [env]
+  (store-token (assoc env :provider :monday)))
+
+(defn store-gitlab-oauth-tokens [env]
+  (store-token (assoc env :provider :gitlab)))
+
+(defn fetch-tokens [{:keys [user-id provider]}]
+  (get-in @oauth-tokens [provider user-id]))
+
+(defn fetch-monday-access-token [env]
+  (:access_token (fetch-tokens (assoc env :provider :monday))))
+
+(defn fetch-gitlab-access-token [env]
+  (:access_token (fetch-tokens (assoc env :provider :gitlab))))
+
 (defn monday-query [query]
   (let [{:keys [body status]}
         (http/post
           "https://api.monday.com/v2"
-          {:oauth-token (:monday/api-token (read-config "config.edn"))
+          {:oauth-token (:monday/api-token app-config)
            ;:oauth-token (get-in _request [:jwt :shortLivedToken])
            :content-type :json
            :form-params {:query (query->graphql query)}})]
@@ -39,46 +71,28 @@
     {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
      :status status}))
 
-(defn handle-integration [payload]
-  ;(log/info "Got payload" payload)
-  {:status 200
-   :body {:result "done"}})
-
-(defn handle-gitlab-projects [payload]
+(defn handle-gitlab-projects [{:keys [payload user-id] :as env}]
   (let [{:keys [inputFields]} payload
-        {:keys [sourceColumnId boardId targetColumnId itemId]} inputFields
-        _ (def _gl-projects-payload payload)
         projects (->> (gitlab-query [(list {:projects
                                             [{:nodes [:fullPath]}]}
                                        {:membership true})]
-                        (:access_token _gitlab-token))
+                        (fetch-gitlab-access-token env))
                    :body
                    :data
                    :projects
                    :nodes
-                   (mapv :fullPath))
-        _ (def _gl-projects projects)
-        body (mapv
-               (fn [project]
-                 {:id project
-                  :title project
-                  :outboundType "text"
-                  :inboundTypes ["text"]})
-               projects)
-        _ (def _gl-body body)]
+                   (mapv :fullPath))]
     {:status 200
      :headers {"content-type" "application/json"}
      :body
      (json/write-value-as-bytes (mapv (fn [project]
                                         {:id project
                                          :value project})
-                                  projects))
-     }))
+                                  projects))}))
 
 (defn handle-text-transformer [payload]
   (let [{:keys [inputFields]} payload
         {:keys [sourceColumnId boardId targetColumnId itemId]} inputFields]
-    (def _tt-payload payload)
     (let [source-column (-> (monday-query [(list {:items [:id :name
                                                           (list {:column_values [:text]}
                                                             {:ids sourceColumnId})]}
@@ -100,11 +114,9 @@
       {:status status
        :body {:result "done"}})))
 
-(defn handle-gitlab-create-issue [payload]
+(defn handle-gitlab-create-issue [{:keys [payload user-id] :as env}]
   (let [{:keys [inputFields]} payload
         {:keys [itemId gitlabProjects]} inputFields]
-    (def _gl-payload payload)
-    (def _gl-item-id itemId)
     (let [item-name (-> (monday-query [(list {:items [:name]}
                                          {:ids [itemId]})])
                       :body
@@ -116,7 +128,7 @@
                                                 {:input {:projectPath (:value gitlabProjects)
                                                          :title item-name}})
                                               [{:issue [:id]}]}]
-                                (:access_token _gitlab-token))
+                                      (fetch-gitlab-access-token env))
                             :body)]
       {:status status
        :body {:result "done"}})))
@@ -137,15 +149,15 @@
   (str "https://auth.monday.com/oauth2/authorize?"
     (http/generate-query-string
       {:state token
-       :client_id (:monday/client-id (read-config "config.edn"))})))
+       :client_id (:monday/client-id app-config)})))
 
 (defn fetch-monday-oauth-token [code]
   (let [{:keys [body status]}
         (http/post
           "https://auth.monday.com/oauth2/token"
           {:content-type :json
-           :query-params {:client_id (:monday/client-id (read-config "config.edn"))
-                          :client_secret (:monday/client-secret (read-config "config.edn"))
+           :query-params {:client_id (:monday/client-id app-config)
+                          :client_secret (:monday/client-secret app-config)
                           :code code
                           :redirect_uri "https://fatih.eu.ngrok.io/oauth/callback"}})]
     {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
@@ -156,8 +168,8 @@
         (http/post
           "https://gitlab.com/oauth/token"
           {:content-type :json
-           :query-params {:client_id (:gitlab/application-id (read-config "config.edn"))
-                          :client_secret (:gitlab/secret (read-config "config.edn"))
+           :query-params {:client_id (:gitlab/application-id app-config)
+                          :client_secret (:gitlab/secret app-config)
                           :code code
                           :redirect_uri "https://fatih.eu.ngrok.io/gitlab/oauth/callback"
                           :grant_type "authorization_code"}})]
@@ -167,9 +179,8 @@
 (defn gitlab-authorize-url [state]
   (str "https://gitlab.com/oauth/authorize?"
     (http/generate-query-string
-      {:client_id (:gitlab/application-id (read-config "config.edn"))
+      {:client_id (:gitlab/application-id app-config)
        :redirect_uri "https://fatih.eu.ngrok.io/gitlab/oauth/callback"
-       ;:scopes "read_user+profile"
        :scopes "api" ; grants complete read/write access
        :response_type "code"
        :state state})))
@@ -186,59 +197,30 @@
                   :responses {200 {:body [any?]}}
                   :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
                              (log/info "gitlab-projects")
-                             (def _gl-projects-request request)
-                             (let [resp (handle-gitlab-projects payload)]
-                               (def _gl-projects-respo resp)
-                               resp)
-                             )}}]]
+                             (handle-gitlab-projects {:payload payload
+                                                      :user-id (get-in request [:jwt :userId])}))}}]]
         ["/action"
-         ["/text-transformer"
-          {:post {:parameters {:body [:map]}
-                  :responses {200 {:body [:map]}}
-                  :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
-                             (log/info "text transformer")
-                             (def _request request)
-                             (handle-text-transformer payload))}}]
          ["/create-gitlab-issue"
           {:post {:parameters {:body [:map]}
                   :responses {200 {:body [:map]}}
                   :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
-                             (def _create-issue-request request)
-                             (def _create-issue-params (get-in _create-issue-request [:parameters :body :payload]))
                              (log/info "create gitlab issue")
-                             (handle-gitlab-create-issue payload))}}]
-         ["/create-page" {:post {:parameters {:body [:map]}
-                                 :responses {200 {:body [:map [:result string?]]}}
-                                 :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
-                                            (def _request request)
-                                            (handle-integration payload))}}]]]
-       ["/api"
-        ["/math" {:get {:parameters {:query [:map [:x int?] [:y int?]]}
-                        :responses {200 {:body [:map [:total int?]]}}
-                        :handler (fn [{{{:keys [x y]} :query} :parameters}]
-                                   {:status 200
-                                    :body {:total (+ x y)}})}}]]
+                             (handle-gitlab-create-issue {:payload payload
+                                                          :user-id (get-in request [:jwt :userId])}))}}]]]
        ["/authorization"
         {:get {:handler (fn [request]
                           (let [{:keys [params]} request
                                 {:strs [token]} params
-                                _ (def _token token)
                                 redirect-url (monday-authorize-url token)
                                 _ (log/info "Redirecting to monday oauth url " redirect-url)]
-                            (def _monday-request request)
                             {:status 302
-                             :headers {"location" redirect-url}})
-                          )}}]
+                             :headers {"location" redirect-url}}))}}]
        ["/oauth/callback"
         {:get {:handler (fn [request]
-                          (def _req request)
                           (let [{:keys [params]} request
                                 {:strs [code state]} params
-                                _ (def _monday-oauth-callback request)
-                                ;_ (def _code (get-in _monday-oauth-callback [:params "code"]))
-                                ;; Fetch monday oauth token
-                                monday-oauth-token (:monday (fetch-monday-oauth-token code))
-                                _ (def _monday-oauth-token monday-oauth-token)
+                                monday-oauth-token (:body (fetch-monday-oauth-token code))
+                                _ (store-monday-oauth-tokens {:state state :token monday-oauth-token})
                                 gitlab-auth-url (gitlab-authorize-url state)
                                 _ (log/info "Redirecting to gitlab auth url " gitlab-auth-url)]
                             {:status 302
@@ -246,18 +228,14 @@
        ["/gitlab"
         ["/oauth/callback"
          {:get {:handler (fn [request]
-                           (def _req request)
                            (let [{:keys [params]} request
                                  {:strs [code state]} params
-                                 _ (def _gitlab-oauth-callback request)
-                                 _ (def _state (get-in _gitlab-oauth-callback [:params "state"]))
-                                 {:keys [backToUrl]} (jwt/unsign state (:monday/signing-secret (read-config "config.edn")))
+                                 back-to-url (state->back-to-url state)
                                  gitlab-token (:body (fetch-gitlab-oauth-token code))
-                                 _ (log/info "Fetched gitlab oauth token")
-                                 _ (def _gitlab-token gitlab-token)]
+                                 _ (store-gitlab-oauth-tokens {:state state :token gitlab-token})]
                              ;; redirect to backtourl monday
                              {:status 302
-                              :headers {"location" backToUrl}}))}}]]]
+                              :headers {"location" back-to-url}}))}}]]]
       ;; router data effecting all routes
       {:data (merge {:muuntaja m/instance
                      :coercion (reitit.coercion.malli/create
@@ -274,7 +252,7 @@
                                   rrc/coerce-exceptions-middleware
                                   rrc/coerce-request-middleware
                                   rrc/coerce-response-middleware]}
-                    (read-config "config.edn"))})
+               app-config)})
     ;; Default handler
     (ring/routes
       (ring/create-resource-handler {:path "/"})
@@ -289,9 +267,12 @@
 (comment
   (start)
 
+  ;; user-id
+  ;; 16227277
+
   (str "https://gitlab.com/oauth/authorize?"
     (http/generate-query-string
-      {:client_id (:gitlab/application-id (read-config "config.edn"))
+      {:client_id (:gitlab/application-id app-config)
        :redirect_uri "https://fatih.eu.ngrok.io/gitlab/oauth/callback"
        :scopes "read_user+profile"
        :response_type "code"}))
@@ -299,7 +280,7 @@
   (jwt/unsign
     ;(get (:headers _request) "authorization")
     _token
-    (:monday/signing-secret (read-config "config.edn")))
+    (:monday/signing-secret app-config))
 
   (let [{:keys [body status]}
         (http/post
@@ -350,12 +331,6 @@
                       [{:issue [:id]}]}]
         (:access_token _gitlab-token))
     :body)
-
-  ;createIssue(input: {projectPath: "fatihict/fatih-test-private-repo", title: "Fatih issue"}) {
-  ;issue {
-  ;       id
-  ;       }
-  ;}
 
   (query->graphql [{:currentUser
                     [:id :name]}])
