@@ -18,6 +18,8 @@
             [clojure.string :as string])
   (:import (org.eclipse.jetty.server Server)))
 
+(def base-url "https://fatih.eu.ngrok.io")
+
 (defonce oauth-tokens (atom {}))
 
 (defonce app-config (read-config "config.edn"))
@@ -159,7 +161,7 @@
            :query-params {:client_id (:monday/client-id app-config)
                           :client_secret (:monday/client-secret app-config)
                           :code code
-                          :redirect_uri "https://fatih.eu.ngrok.io/oauth/callback"}})]
+                          :redirect_uri (str base-url "/oauth/callback")}})]
     {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
      :status status}))
 
@@ -171,7 +173,7 @@
            :query-params {:client_id (:gitlab/application-id app-config)
                           :client_secret (:gitlab/secret app-config)
                           :code code
-                          :redirect_uri "https://fatih.eu.ngrok.io/gitlab/oauth/callback"
+                          :redirect_uri (str base-url "/gitlab/oauth/callback")
                           :grant_type "authorization_code"}})]
     {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
      :status status}))
@@ -180,7 +182,7 @@
   (str "https://gitlab.com/oauth/authorize?"
     (http/generate-query-string
       {:client_id (:gitlab/application-id app-config)
-       :redirect_uri "https://fatih.eu.ngrok.io/gitlab/oauth/callback"
+       :redirect_uri (str base-url "/gitlab/oauth/callback")
        :scopes "api" ; grants complete read/write access
        :response_type "code"
        :state state})))
@@ -233,7 +235,6 @@
                                  back-to-url (state->back-to-url state)
                                  gitlab-token (:body (fetch-gitlab-oauth-token code))
                                  _ (store-gitlab-oauth-tokens {:state state :token gitlab-token})]
-                             ;; redirect to backtourl monday
                              {:status 302
                               :headers {"location" back-to-url}}))}}]]]
       ;; router data effecting all routes
