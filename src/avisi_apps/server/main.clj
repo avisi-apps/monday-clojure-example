@@ -29,6 +29,9 @@
 
 (def gitlab-api-url (str gitlab-base-url "/api/v4"))
 
+(defn gitlab-gid [id]
+  (str "gid://gitlab/Issue/" id))
+
 (defonce oauth-tokens (atom {}))
 
 (defonce subscriptions (atom {}))
@@ -192,13 +195,16 @@
 (defn gitlab-create-webhook [{:keys [payload] :as env}]
   (let [project (-> (get-in payload [:inputFields :gitlabProject :value])
                   (http-util/url-encode))
-        {:keys [body status]} (http/post (str gitlab-api-url "/projects/" project "/hooks")
+        body (-> (http/post (str gitlab-api-url "/projects/" project "/hooks")
                                 {:oauth-token (fetch-gitlab-access-token env)
                                  :content-type :json
                                  :form-params {:issues_events true
                                                ;:push_events_branch_filter "develop"
-                                               :url (str base-url "/webhooks/gitlab/issue-created")}})]
-    (:project_id (json/read-value body (json/object-mapper {:decode-key-fn true})))))
+                                               :url (str base-url "/webhooks/gitlab/issue-created")}})
+               :body
+               (json/read-value (json/object-mapper {:decode-key-fn true})))]
+    {:project-id (:project_id body)
+     :webhook-id (:webhook-id body)}))
 
 (defn gitlab-remove-webhook [{:keys [payload webhook-id] :as env}]
   (let [project (-> (get-in payload [:inputFields :gitlabProject :value])
@@ -207,20 +213,36 @@
       {:oauth-token (fetch-gitlab-access-token env)})))
 
 (defn handle-gitlab-issue-created-webhook [{:keys [body] :as env}]
+  (def _handle-gitlab-issue-created-webhook-env env)
   (let [project-id (get-in body [:project :id])
-        issue-id (get-in body [:object_attributes :iid])
+        issue-id (get-in body [:object_attributes :id])
         {:keys [webhook-url]} (fetch-subscription project-id)]
     (http/post webhook-url
       {:headers {"authorization" (:monday/signing-secret app-config)}
        :content-type :json
-       :form-params {"trigger" {"outputFields" {"gitLabIssueId" issue-id}}}})
+       :form-params {"trigger" {"outputFields" {"gitLabIssueId" (gitlab-gid issue-id)}}}})
     {:status 204}))
 
 (defn handle-create-n-sync-item [{:keys [payload] :as env}]
+  (def _env env)
   (let [{:keys [gitLabIssueId boardId]} (:inputFields payload)]
     ;; try to fetch item... But which item??
 
+
+
     ;; Create Item
+    (let [{:keys [title] :as issue} (-> (gitlab-query
+                                          [(list {:issue [:id :title]}
+                                             {:id gitLabIssueId})]
+                                          (fetch-gitlab-access-token env))
+                                      (get-in [:body :data :issue]))
+          item-id (-> (monday-query
+                        [{(list 'create_item
+                            {:board_id boardId
+                             :item_name title})
+                          [:id]}]
+                        (fetch-monday-access-token env))
+                    (get-in [:body :data :create_item :id]))])
 
     ;; Update Item
     {:status 204}))
@@ -393,6 +415,10 @@
                     [:id :name]}])
 
 
+  (gitlab-query [(list {:issue [:id :title]}
+                    {:id "gid://gitlab/Issue/77098853"})]
+    (get-in @oauth-tokens [:gitlab 16227277 :access_token]))
+
 
   (let [query [(list {:items [:id :name]}
                  {:ids [749796988]})]
@@ -421,6 +447,14 @@
       {:oauth-token (get-in @oauth-tokens [:gitlab 16227277 :access_token])}))
 
   (http-util/url-encode "fatihict/fatih-test-private-repo")
+
+  "{\"url\":\"http://monday.com\",\"text\":\"go to monday!\"}"
+
+  ;reate_column (board_id: 749796977, title: "Gitlab Pro column", column_type: link) {
+  ;                                                                                   id,
+  ;                                                                                   pos,
+  ;                                                                                   title
+  ;                                                                                   }
 
   )
 
