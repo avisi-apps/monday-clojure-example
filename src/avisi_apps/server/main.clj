@@ -15,6 +15,7 @@
             [jsonista.core :as json]
             [com.wsscode.pathom.graphql :refer [query->graphql]]
             [clj-http.client :as http]
+            [clj-http.util :as http-util]
             [clojure.string :as string])
   (:import (org.eclipse.jetty.server Server)))
 
@@ -24,7 +25,27 @@
 
 (def base-url "https://fatih.eu.ngrok.io")
 
+(def gitlab-base-url "https://gitlab.com")
+
+(def gitlab-api-url (str gitlab-base-url "/api/v4"))
+
 (defonce oauth-tokens (atom {}))
+
+(defonce subscriptions (atom {}))
+
+(defn store-subscription [{:keys [subscriptionId recipeId webhookUrl inputFields project-id webhook-id]}]
+  (let [gitlab-project (get-in inputFields [:gitlabProject :value])]
+    (swap! subscriptions assoc project-id {:webhook-url webhookUrl
+                                           :webhook-id webhook-id
+                                           :subscription-id subscriptionId
+                                           :gitlab-project gitlab-project
+                                           :recipe-id recipeId})))
+
+(defn remove-subscription [project-id]
+  (swap! subscriptions dissoc project-id))
+
+(defn fetch-subscription [project-id]
+  (get @subscriptions project-id))
 
 (defonce app-config (read-config "config.edn"))
 
@@ -60,6 +81,11 @@
   {:status 302
    :headers {"location" location}})
 
+(defn json-response [body]
+  {:status 200
+   :headers {"content-type" "application/json"}
+   :body (json/write-value-as-bytes body)})
+
 (defn monday-query [query access-token]
   (let [{:keys [body status]}
         (http/post
@@ -73,7 +99,7 @@
 (defn gitlab-query [query access-token]
   (let [{:keys [body status]}
         (http/post
-          "https://gitlab.com/api/graphql"
+          (str gitlab-base-url "/api/graphql")
           {:oauth-token access-token
            :content-type :json
            :form-params {:query (query->graphql query)}})]
@@ -100,12 +126,8 @@
         {:keys [itemId gitlabProject]} inputFields
         item-name (-> (monday-query [(list {:items [:name]}
                                        {:ids [itemId]})]
-                        (fetch-gitlab-access-token env))
-                    :body
-                    :data
-                    :items
-                    first
-                    :name)
+                        (fetch-monday-access-token env))
+                    (get-in [:body :data :items 0 :name]))
         {:keys [body status]} (-> (gitlab-query [{(list 'createIssue
                                                     {:input {:projectPath (:value gitlabProject)
                                                              :title item-name}})
@@ -167,6 +189,42 @@
        :response_type "code"
        :state state})))
 
+(defn gitlab-create-webhook [{:keys [payload] :as env}]
+  (let [project (-> (get-in payload [:inputFields :gitlabProject :value])
+                  (http-util/url-encode))
+        {:keys [body status]} (http/post (str gitlab-api-url "/projects/" project "/hooks")
+                                {:oauth-token (fetch-gitlab-access-token env)
+                                 :content-type :json
+                                 :form-params {:issues_events true
+                                               ;:push_events_branch_filter "develop"
+                                               :url (str base-url "/webhooks/gitlab/issue-created")}})]
+    (:project_id (json/read-value body (json/object-mapper {:decode-key-fn true})))))
+
+(defn gitlab-remove-webhook [{:keys [payload webhook-id] :as env}]
+  (let [project (-> (get-in payload [:inputFields :gitlabProject :value])
+                  (http-util/url-encode))]
+    (http/delete (str gitlab-api-url "/projects/" project "/hooks/" webhook-id)
+      {:oauth-token (fetch-gitlab-access-token env)})))
+
+(defn handle-gitlab-issue-created-webhook [{:keys [body] :as env}]
+  (let [project-id (get-in body [:project :id])
+        issue-id (get-in body [:object_attributes :iid])
+        {:keys [webhook-url]} (fetch-subscription project-id)]
+    (http/post webhook-url
+      {:headers {"authorization" (:monday/signing-secret app-config)}
+       :content-type :json
+       :form-params {"trigger" {"outputFields" {"gitLabIssueId" issue-id}}}})
+    {:status 204}))
+
+(defn handle-create-n-sync-item [{:keys [payload] :as env}]
+  (let [{:keys [gitLabIssueId boardId]} (:inputFields payload)]
+    ;; try to fetch item... But which item??
+
+    ;; Create Item
+
+    ;; Update Item
+    {:status 204}))
+
 (def app
   (ring/ring-handler
     ;; Routes
@@ -182,13 +240,52 @@
                              (handle-gitlab-projects {:payload payload
                                                       :user-id (get-in request [:jwt :userId])}))}}]]
         ["/action"
-         ["/create-gitlab-issue"
-          {:post {:parameters {:body [:map]}
-                  :responses {200 {:body [:map]}}
-                  :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
-                             (log/info "create gitlab issue")
-                             (handle-gitlab-create-issue {:payload payload
+         ["/gitlab"
+          ["/create-issue"
+           {:post {:parameters {:body [:map]}
+                   :responses {200 {:body [any?]}}
+                   :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                              (log/info "create gitlab issue")
+                              (handle-gitlab-create-issue {:payload payload
+                                                           :user-id (get-in request [:jwt :userId])}))}}]
+          ["/create-n-sync-item"
+           {:post {:parameters {:body [:map]}
+                   :responses {200 {:body [any?]}}
+                   :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                              (log/info "create-n-sync-item")
+
+                              (handle-create-n-sync-item {:payload payload
                                                           :user-id (get-in request [:jwt :userId])}))}}]]]
+        ["/subscribe"
+         ["/gitlab"
+          ["/issue-created" {:post {:parameters {:body [:map]}
+                                    :responses {200 {:body [any?]}}
+                                    :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                                               (log/info "subscribe gitlab create issue")
+                                               (let [{:keys [project-id webhook-id]} (gitlab-create-webhook {:payload payload
+                                                                                                             :user-id (get-in request [:jwt :userId])})]
+                                                 (store-subscription (assoc payload :project-id project-id :webhook-id webhook-id))
+                                                 (json-response {:webhookId project-id})))}}]]]
+        ["/unsubscribe"
+         ["/gitlab"
+          ["/issue-created" {:post {:parameters {:body [:map]}
+                                    :responses {200 {:body [any?]}}
+                                    :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                                               (log/info "unsubscribe gitlab create issue")
+                                               (let [project-id (:webhookId payload)
+                                                     webhook-id (:webhook-id (fetch-subscription project-id))]
+                                                 (remove-subscription project-id)
+                                                 (gitlab-remove-webhook {:payload payload
+                                                                         :webhook-id webhook-id})
+                                                 {:status 204}))}}]]]]
+       ["/webhooks"
+        ["/gitlab"
+         ["/issue-created" {:post {:parameters {:body [:map]}
+                                   :responses {200 {:body [any?]}}
+                                   :handler (fn [{{:keys [body]} :parameters :as request}]
+                                              (log/info "webhook gitlab create issue")
+                                              (handle-gitlab-issue-created-webhook {:body body
+                                                                                    :user-id (get-in request [:jwt :userId])}))}}]]]
        ["/authorization"
         {:get {:handler (fn [request]
                           (let [{:keys [params]} request
@@ -199,7 +296,10 @@
                             (redirect-response (cond
                                                  (and gitlab-authorized? monday-authorized?) (state->back-to-url token)
                                                  monday-authorized? (gitlab-authorize-url token)
-                                                 :else (monday-authorize-url token)))))}}]
+                                                 :else (monday-authorize-url token)))
+                            #_{:status 200
+                             :body "<html>\n       <meta charset=\"utf-8\">\n       <body>\n       <div id=\"app\"></div>\n       <script src=\"/js/board-view.js\"></script>\n       </body>\n       </html>"}))}}]
+
        ["/oauth/callback"
         {:get {:handler (fn [request]
                           (let [{:keys [params]} request
@@ -291,6 +391,36 @@
 
   (query->graphql [{:currentUser
                     [:id :name]}])
+
+
+
+  (let [query [(list {:items [:id :name]}
+                 {:ids [749796988]})]
+        {:keys [body status]}
+        (http/post
+          "https://api.monday.com/v2"
+          {:oauth-token (get-in @oauth-tokens [:monday 16227277 :access_token])
+           :content-type :json
+           :form-params {:query (query->graphql query)}})]
+    {:body (json/read-value body (json/object-mapper {:decode-key-fn true}))
+     :status status})
+
+  (let [id "fatihict%2Ffatih-test-private-repo"
+        id-encoded (http/url-encode-illegal-characters id)
+        {:keys [body status]} (http/post (str gitlab-api-url "/projects/" id-encoded "/hooks")
+                                {:oauth-token (get-in @oauth-tokens [:gitlab 16227277 :access_token])
+                                 :content-type :json
+                                 :form-params {:issues_events true
+                                               ;:push_events_branch_filter "develop"
+                                               :url (str base-url "/webhooks/gitlab/issue-created")}})]
+    (json/read-value body (json/object-mapper {:decode-key-fn true})))
+
+  (let [id "fatihict/fatih-test-private-repo"
+        id-encoded (http/url-encode-illegal-characters id)]
+    (http/get (str gitlab-api-url "/projects/" id-encoded "/hooks")
+      {:oauth-token (get-in @oauth-tokens [:gitlab 16227277 :access_token])}))
+
+  (http-util/url-encode "fatihict/fatih-test-private-repo")
 
   )
 
