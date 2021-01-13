@@ -19,6 +19,10 @@
             [clojure.string :as string])
   (:import (org.eclipse.jetty.server Server)))
 
+(defonce dev-env {:user-id 16227277
+                  :board-id 749796977
+                  :item-id 964580336})
+
 (declare gitlab-query)
 
 (declare fetch-gitlab-access-token)
@@ -32,9 +36,16 @@
 (defn gitlab-gid [id]
   (str "gid://gitlab/Issue/" id))
 
+(defn parse-int [s]
+  (try (Integer/parseInt s)
+       (catch Exception _
+         nil)))
+
 (defonce oauth-tokens (atom {}))
 
 (defonce subscriptions (atom {}))
+
+(defonce config-storage (atom {}))
 
 (defn store-subscription [{:keys [subscriptionId recipeId webhookUrl inputFields project-id webhook-id]}]
   (let [gitlab-project (get-in inputFields [:gitlabProject :value])]
@@ -49,6 +60,15 @@
 
 (defn fetch-subscription [project-id]
   (get @subscriptions project-id))
+
+(defn store-config [ks v]
+  (swap! config-storage assoc-in ks v))
+
+(defn remove-config [k]
+  (swap! config-storage dissoc k))
+
+(defn fetch-config [ks]
+  (get-in @config-storage ks))
 
 (defonce app-config (read-config "config.edn"))
 
@@ -213,7 +233,6 @@
       {:oauth-token (fetch-gitlab-access-token env)})))
 
 (defn handle-gitlab-issue-created-webhook [{:keys [body] :as env}]
-  (def _handle-gitlab-issue-created-webhook-env env)
   (let [project-id (get-in body [:project :id])
         issue-id (get-in body [:object_attributes :id])
         {:keys [webhook-url]} (fetch-subscription project-id)]
@@ -223,27 +242,54 @@
        :form-params {"trigger" {"outputFields" {"gitLabIssueId" (gitlab-gid issue-id)}}}})
     {:status 204}))
 
+(defn monday-item-by-id [{:keys [item-id] :as env}]
+  (-> (monday-query [(list {:items [:id :name]}
+                       {:ids [item-id]})]
+        (fetch-monday-access-token env))
+    (get-in [:body :data :items 0])))
+
+(defn gitlab-issue-by-id [{:keys [gitlab-issue-id board-id] :as env}]
+  (-> (gitlab-query
+        [(list {:issue [:id :title]}
+           {:id gitlab-issue-id})]
+        (fetch-gitlab-access-token env))
+    (get-in [:body :data :issue])))
+
+(defn create-monday-item [{:keys [gitlab-issue-id board-id] :as env}]
+  (let [{:keys [title]} (gitlab-issue-by-id env)
+        item-id (-> (monday-query
+                      [{(list 'create_item
+                          {:board_id board-id
+                           :item_name title})
+                        [:id]}]
+                      (fetch-monday-access-token env))
+                  (get-in [:body :data :create_item :id]))]
+    (store-config [:create-n-sync gitlab-issue-id] {:item-id (parse-int item-id)
+                                                    :gitlab-issue-id gitlab-issue-id})))
+
+(defn update-monday-item [{:keys [board-id item-id new-columns] :as env}]
+  (monday-query
+    [{(list 'change_multiple_column_values
+        {:item_id item-id
+         :board_id board-id
+         :column_values (json/write-value-as-string new-columns)})
+      [:id]}]
+    (fetch-monday-access-token env)))
+
+(defn sync-monday-item-with-gitlab-issue [{:keys [board-id item-id new-columns] :as env}]
+  (let [{:keys [title]} (gitlab-issue-by-id env)]
+    (update-monday-item (assoc env :new-columns {:name title}))))
+
 (defn handle-create-n-sync-item [{:keys [payload] :as env}]
-  (def _env env)
-  (let [{:keys [gitLabIssueId boardId]} (:inputFields payload)]
-    ;; try to fetch item... But which item??
-
-
-
-    ;; Create Item
-    (let [{:keys [title] :as issue} (-> (gitlab-query
-                                          [(list {:issue [:id :title]}
-                                             {:id gitLabIssueId})]
-                                          (fetch-gitlab-access-token env))
-                                      (get-in [:body :data :issue]))
-          item-id (-> (monday-query
-                        [{(list 'create_item
-                            {:board_id boardId
-                             :item_name title})
-                          [:id]}]
-                        (fetch-monday-access-token env))
-                    (get-in [:body :data :create_item :id]))])
-
+  (let [{:keys [gitLabIssueId boardId]} (:inputFields payload)
+        item-id (fetch-config [:create-n-sync gitLabIssueId :item-id])
+        env (assoc env :gitlab-issue-id gitLabIssueId
+                       :board-id boardId
+                       :item-id item-id)]
+    (cond
+      ;; TODO Error handling: Item exist but pulse doesn't exist
+      item-id (sync-monday-item-with-gitlab-issue env)
+      :else (create-monday-item env))
     ;; Update Item
     {:status 204}))
 
@@ -447,14 +493,6 @@
       {:oauth-token (get-in @oauth-tokens [:gitlab 16227277 :access_token])}))
 
   (http-util/url-encode "fatihict/fatih-test-private-repo")
-
-  "{\"url\":\"http://monday.com\",\"text\":\"go to monday!\"}"
-
-  ;reate_column (board_id: 749796977, title: "Gitlab Pro column", column_type: link) {
-  ;                                                                                   id,
-  ;                                                                                   pos,
-  ;                                                                                   title
-  ;                                                                                   }
 
   )
 
