@@ -27,6 +27,9 @@
 
 (declare fetch-gitlab-access-token)
 
+(def issue-created-webhook-subscription-type :create-n-sync)
+(def commit-pushed-webhook-subscription-type :commit-pushed)
+
 (def base-url "https://fatih.eu.ngrok.io")
 
 (def gitlab-base-url "https://gitlab.com")
@@ -45,6 +48,7 @@
 
 (defonce subscriptions (atom {}))
 
+;; TODO, clear this after removing a subscription?
 (defonce config-storage (atom {}))
 
 (comment
@@ -54,19 +58,19 @@
 
   )
 
-(defn store-subscription [{:keys [subscriptionId recipeId webhookUrl inputFields project-id webhook-id]}]
+(defn store-subscription [{:keys [subscriptionId recipeId webhookUrl inputFields subscription-type project-id webhook-id]}]
   (let [gitlab-project (get-in inputFields [:gitlabProject :value])]
-    (swap! subscriptions assoc project-id {:webhook-url webhookUrl
-                                           :webhook-id webhook-id
-                                           :subscription-id subscriptionId
-                                           :gitlab-project gitlab-project
-                                           :recipe-id recipeId})))
+    (swap! subscriptions assoc (str subscription-type "-" project-id) {:webhook-url webhookUrl
+                                                                  :webhook-id webhook-id
+                                                                  :subscription-id subscriptionId
+                                                                  :gitlab-project gitlab-project
+                                                                  :recipe-id recipeId})))
 
-(defn remove-subscription [project-id]
-  (swap! subscriptions dissoc project-id))
+(defn remove-subscription [subscriptions-type project-id]
+  (swap! subscriptions dissoc (str subscriptions-type "-" project-id)))
 
-(defn fetch-subscription [project-id]
-  (get @subscriptions project-id))
+(defn fetch-subscription [subscriptions-type project-id]
+  (get @subscriptions (str subscriptions-type "-" project-id)))
 
 (defn store-config [ks v]
   (swap! config-storage assoc-in ks v))
@@ -239,9 +243,23 @@
         body (-> (http/post (str gitlab-api-url "/projects/" project "/hooks")
                                 {:oauth-token (fetch-gitlab-access-token env)
                                  :content-type :json
-                                 :form-params {:issues_events true
+                                 :form-params {:push_events true
                                                ;:push_events_branch_filter "develop"
                                                :url (str base-url "/webhooks/gitlab/issue-created")}})
+               :body
+               (json/read-value (json/object-mapper {:decode-key-fn true})))]
+    {:project-id (:project_id body)
+     :webhook-id (:id body)}))
+
+(defn gitlab-commit-pushed-webhook [{:keys [payload] :as env}]
+  (let [project (-> (get-in payload [:inputFields :gitlabProject :value])
+                  (http-util/url-encode))
+        body (-> (http/post (str gitlab-api-url "/projects/" project "/hooks")
+                   {:oauth-token (fetch-gitlab-access-token env)
+                    :content-type :json
+                    :form-params {:issues_events true
+                                  ;:push_events_branch_filter "develop"
+                                  :url (str base-url "/webhooks/gitlab/commit-pushed")}})
                :body
                (json/read-value (json/object-mapper {:decode-key-fn true})))]
     {:project-id (:project_id body)
@@ -256,7 +274,7 @@
         issue (:object_attributes body)
         user (:user body)
         issue-id (:id issue)
-        {:keys [webhook-url]} (fetch-subscription (:id project))]
+        {:keys [webhook-url]} (fetch-subscription issue-created-webhook-subscription-type (:id project))]
     (http/post webhook-url
       {:headers {"authorization" (:monday/signing-secret app-config)}
        :content-type :json
@@ -265,6 +283,23 @@
                                                                "description" (:description issue)
                                                                "authorName" (:name user)
                                                                "authorUsername" (:username user)}}}}})
+    {:status 204}))
+
+(defn handle-gitlab-commit-pushed-webhook [{:keys [body] :as env}]
+  (let [project (:project body)
+        issue (:object_attributes body)
+        latest-commit (get-in body [:commits 0])
+        commit-author (:author latest-commit)
+        issue-id (:id issue)
+        {:keys [webhook-url]} (fetch-subscription commit-pushed-webhook-subscription-type (:id project))]
+    (http/post webhook-url
+      {:headers {"authorization" (:monday/signing-secret app-config)}
+       :content-type :json
+       :form-params {"trigger" {"outputFields" {"gitlabIssueId" (gitlab-gid issue-id)
+                                                "gitlabCommit" {"commitTitle" (:title latest-commit)
+                                                                "commitMessage" (:message latest-commit)
+                                                                "commitAuthorName" (:name commit-author)
+                                                                "commitAuthorEmail" (:email commit-author)}}}}})
     {:status 204}))
 
 (defn monday-item-by-id [{:keys [item-id] :as env}]
@@ -280,9 +315,8 @@
         (fetch-gitlab-access-token env))
     (get-in [:body :data :issue])))
 
-(defn create-monday-item [{:keys [gitlab-issue-id board-id column-mapping] :as env}]
-  (let [{:keys [title]} (gitlab-issue-by-id env)
-        item-id (-> (monday-query
+(defn create-monday-item [{:keys [gitlab-issue-id board-id column-mapping subscription-type title] :as env}]
+  (let [item-id (-> (monday-query
                       [{(list 'create_item
                           {:board_id board-id
                            :item_name title
@@ -290,8 +324,8 @@
                         [:id]}]
                       (fetch-monday-access-token env))
                   (get-in [:body :data :create_item :id]))]
-    (store-config [:create-n-sync gitlab-issue-id] {:item-id (parse-int item-id)
-                                                    :gitlab-issue-id gitlab-issue-id})))
+    (store-config [subscription-type gitlab-issue-id] {:item-id (parse-int item-id)
+                                                       :gitlab-issue-id gitlab-issue-id})))
 
 (defn update-monday-item [{:keys [board-id item-id column-mapping] :as env}]
   (monday-query
@@ -301,9 +335,6 @@
          :column_values (json/write-value-as-string column-mapping)})
       [:id]}]
     (fetch-monday-access-token env)))
-
-(defn sync-monday-item-with-gitlab-issue [env]
-  (update-monday-item env))
 
 (defn handle-column-mapping [{:keys [payload] :as env}]
   (let [{:keys [inputFields]} payload
@@ -319,6 +350,25 @@
      :headers {"content-type" "application/json"}
      :body
      (json/write-value-as-bytes res)}))
+
+(defn handle-gitlab-commit [env]
+  {:status 200
+   :headers {"content-type" "application/json"}
+   :body
+   (json/write-value-as-bytes (mapv
+                                (fn [{:keys [id title]}]
+                                  {:id id
+                                   :title title
+                                   :outboundType "text"
+                                   :inboundTypes ["text"]})
+                                [{:id "commitTitle"
+                                  :title "Commit Title"}
+                                 {:id "commitMessage"
+                                  :title "Commit Message"}
+                                 {:id "commitAuthorName"
+                                  :title "Commit Author Name"}
+                                 {:id "commitAuthorEmail"
+                                  :title "Commit Author Email"}]))})
 
 (defn handle-gitlab-issue [env]
   {:status 200
@@ -339,17 +389,49 @@
                                  {:id "authorUsername"
                                   :title "Author Username"}]))})
 
-(defn handle-create-n-sync-item [{:keys [payload] :as env}]
+(defn handle-gitlab-create-n-sync-item [{:keys [payload] :as env}]
   (let [{:keys [gitlabIssueId boardId columnMapping]} (:inputFields payload)
-        item-id (fetch-config [:create-n-sync gitlabIssueId :item-id])
+        item-id (fetch-config [issue-created-webhook-subscription-type gitlabIssueId :item-id])
+        env (assoc env :gitlab-issue-id gitlabIssueId
+                       :column-mapping columnMapping
+                       :board-id boardId
+                       :item-id item-id
+                       :subscription-type issue-created-webhook-subscription-type
+                       :title (:name columnMapping))]
+    (cond
+      ;; TODO Error handling: Item exist but pulse doesn't exist
+      item-id (update-monday-item env)
+      :else (create-monday-item env))
+    ;; Update Item
+    {:status 204}))
+
+(defn handle-gitlab-create-item [{:keys [payload] :as env}]
+  (let [{:keys [gitlabIssueId boardId columnMapping]} (:inputFields payload)
+        item-id (fetch-config [issue-created-webhook-subscription-type gitlabIssueId :item-id])
+        env (assoc env :gitlab-issue-id gitlabIssueId
+                       :column-mapping columnMapping
+                       :board-id boardId
+                       :item-id item-id
+                       :subscription-type issue-created-webhook-subscription-type
+                       :title (:name columnMapping))]
+    (try
+      (create-monday-item env)
+      (catch Exception e
+        (log/debug "create item failed" e)))
+    ;; Update Item
+    {:status 204}))
+
+(defn handle-gitlab-update-item [{:keys [payload] :as env}]
+  (let [{:keys [gitlabIssueId boardId columnMapping]} (:inputFields payload)
+        item-id (fetch-config [issue-created-webhook-subscription-type gitlabIssueId :item-id])
         env (assoc env :gitlab-issue-id gitlabIssueId
                        :column-mapping columnMapping
                        :board-id boardId
                        :item-id item-id)]
-    (cond
-      ;; TODO Error handling: Item exist but pulse doesn't exist
-      item-id (sync-monday-item-with-gitlab-issue env)
-      :else (create-monday-item env))
+    (try
+      (update-monday-item env)
+      (catch Exception e
+        (log/debug "update item failed" e)))
     ;; Update Item
     {:status 204}))
 
@@ -360,12 +442,20 @@
       [["/integrations"
         {:middleware [[monday-authentication-middleware]]}
         ["/field-types"
+         ;; TODO make field definition
          ["/gitlab-issue"
           {:post {:parameters {:body [:map]}
                   :responses {200 {:body [any?]}}
                   :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
                              (log/info "gitlab-issue")
                              (handle-gitlab-issue {:payload payload
+                                                   :user-id (get-in request [:jwt :userId])}))}}]
+         ["/gitlab-commit"
+          {:post {:parameters {:body [:map]}
+                  :responses {200 {:body [any?]}}
+                  :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                             (log/info "gitlab-commit")
+                             (handle-gitlab-commit {:payload payload
                                                    :user-id (get-in request [:jwt :userId])}))}}]
          ["/gitlab-projects"
           {:post {:parameters {:body [:map]}
@@ -394,8 +484,22 @@
            {:post {:parameters {:body [:map]}
                    :responses {200 {:body [any?]}}
                    :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
-                              (log/info "create-n-sync-item")
-                              (handle-create-n-sync-item {:payload payload
+                              (log/info "create-n-sync-gitlab-item")
+                              (handle-gitlab-create-n-sync-item {:payload payload
+                                                          :user-id (get-in request [:jwt :userId])}))}}]
+          ["/create-mapped-item"
+           {:post {:parameters {:body [:map]}
+                   :responses {200 {:body [any?]}}
+                   :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                              (log/info "create mapped gitlab item")
+                              (handle-gitlab-create-item {:payload payload
+                                                          :user-id (get-in request [:jwt :userId])}))}}]
+          ["/update-mapped-item"
+           {:post {:parameters {:body [:map]}
+                   :responses {200 {:body [any?]}}
+                   :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                              (log/info "update mapped gitlab item")
+                              (handle-gitlab-update-item {:payload payload
                                                           :user-id (get-in request [:jwt :userId])}))}}]]]
         ["/subscribe"
          ["/gitlab"
@@ -405,8 +509,20 @@
                                                (log/info "subscribe gitlab create issue")
                                                (let [{:keys [project-id webhook-id]} (gitlab-create-webhook {:payload payload
                                                                                                              :user-id (get-in request [:jwt :userId])})]
-                                                 (store-subscription (assoc payload :project-id project-id :webhook-id webhook-id))
-                                                 (json-response {:webhookId project-id})))}}]]]
+                                                 (store-subscription (assoc payload :project-id project-id
+                                                                                    :webhook-id webhook-id
+                                                                                    :subscription-type issue-created-webhook-subscription-type))
+                                                 (json-response {:webhookId (str issue-created-webhook-subscription-type "-" project-id)})))}}]
+          ["/commit-pushed" {:post {:parameters {:body [:map]}
+                                    :responses {200 {:body [any?]}}
+                                    :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                                               (log/info "subscribe gitlab commit pushed")
+                                               (let [{:keys [project-id webhook-id]} (gitlab-commit-pushed-webhook {:payload payload
+                                                                                                                    :user-id (get-in request [:jwt :userId])})]
+                                                 (store-subscription (assoc payload :project-id project-id
+                                                                                    :webhook-id webhook-id
+                                                                                    :subscription-type commit-pushed-webhook-subscription-type))
+                                                 (json-response {:webhookId (str commit-pushed-webhook-subscription-type "-" project-id)})))}}]]]
         ["/unsubscribe"
          ["/gitlab"
           ["/issue-created" {:post {:parameters {:body [:map]}
@@ -414,8 +530,20 @@
                                     :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
                                                (log/info "unsubscribe gitlab create issue")
                                                (let [project-id (:webhookId payload)
-                                                     webhook-id (:webhook-id (fetch-subscription project-id))]
-                                                 (remove-subscription project-id)
+                                                     webhook-id (:webhook-id (fetch-subscription issue-created-webhook-subscription-type project-id))]
+                                                 (remove-subscription issue-created-webhook-subscription-type project-id)
+                                                 (gitlab-remove-webhook {:payload payload
+                                                                         :project-id project-id
+                                                                         :webhook-id webhook-id
+                                                                         :user-id (get-in request [:jwt :userId])})
+                                                 {:status 204}))}}]
+          ["/commit-pushed" {:post {:parameters {:body [:map]}
+                                    :responses {200 {:body [any?]}}
+                                    :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
+                                               (log/info "unsubscribe gitlab commit pushed")
+                                               (let [project-id (:webhookId payload)
+                                                     webhook-id (:webhook-id (fetch-subscription commit-pushed-webhook-subscription-type project-id))]
+                                                 (remove-subscription commit-pushed-webhook-subscription-type project-id)
                                                  (gitlab-remove-webhook {:payload payload
                                                                          :project-id project-id
                                                                          :webhook-id webhook-id
@@ -428,6 +556,12 @@
                                    :handler (fn [{{:keys [body]} :parameters :as request}]
                                               (log/info "webhook gitlab create issue")
                                               (handle-gitlab-issue-created-webhook {:body body
+                                                                                    :user-id (get-in request [:jwt :userId])}))}}]
+         ["/commit-pushed" {:post {:parameters {:body [:map]}
+                                   :responses {200 {:body [any?]}}
+                                   :handler (fn [{{:keys [body]} :parameters :as request}]
+                                              (log/info "webhook gitlab create issue")
+                                              (handle-gitlab-commit-pushed-webhook {:body body
                                                                                     :user-id (get-in request [:jwt :userId])}))}}]]]
        ["/authorization"
         {:get {:handler (fn [request]
