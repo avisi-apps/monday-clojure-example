@@ -315,6 +315,15 @@
         (fetch-gitlab-access-token env))
     (get-in [:body :data :issue])))
 
+(defn create-monday-item-update [{:keys [item-id body] :as env}]
+  (monday-query
+    [{(list 'create_update
+        {:item_id item-id
+         :body body})
+      [:id]}]
+    (fetch-monday-access-token env))
+  {:status 204})
+
 (defn create-monday-item [{:keys [gitlab-issue-id board-id column-mapping subscription-type title] :as env}]
   (let [item-id (-> (monday-query
                       [{(list 'create_item
@@ -421,17 +430,18 @@
     ;; Update Item
     {:status 204}))
 
-(defn handle-gitlab-update-item [{:keys [payload] :as env}]
-  (let [{:keys [gitlabIssueId boardId columnMapping]} (:inputFields payload)
+(defn handle-gitlab-item-update [{:keys [payload] :as env}]
+  (let [{:keys [gitlabIssueId boardId gitlabCommit]} (:inputFields payload)
         item-id (fetch-config [issue-created-webhook-subscription-type gitlabIssueId :item-id])
+        {:keys [commitTitle commitAuthorName]} gitlabCommit
         env (assoc env :gitlab-issue-id gitlabIssueId
-                       :column-mapping columnMapping
                        :board-id boardId
+                       :body (str "Commit pushed with title \"" commitTitle "\"" " by author " commitAuthorName)
                        :item-id item-id)]
     (try
-      (update-monday-item env)
+      (create-monday-item-update env)
       (catch Exception e
-        (log/debug "update item failed" e)))
+        (log/debug "item update failed" e)))
     ;; Update Item
     {:status 204}))
 
@@ -494,12 +504,12 @@
                               (log/info "create mapped gitlab item")
                               (handle-gitlab-create-item {:payload payload
                                                           :user-id (get-in request [:jwt :userId])}))}}]
-          ["/update-mapped-item"
+          ["/create-item-update"
            {:post {:parameters {:body [:map]}
                    :responses {200 {:body [any?]}}
                    :handler (fn [{{{:keys [payload]} :body} :parameters :as request}]
-                              (log/info "update mapped gitlab item")
-                              (handle-gitlab-update-item {:payload payload
+                              (log/info "create item update")
+                              (handle-gitlab-item-update {:payload payload
                                                           :user-id (get-in request [:jwt :userId])}))}}]]]
         ["/subscribe"
          ["/gitlab"
@@ -737,6 +747,13 @@
             (seq columns) (assoc :column_values (json/write-value-as-string column-mapping))))
         [:id]}]
       (fetch-monday-access-token dev-env)))
+
+  (monday-query
+    [{(list 'create_update
+        {:item_id 970901943
+         :body "This is an update"})
+      [:id]}]
+    (fetch-monday-access-token dev-env))
 
   )
 
