@@ -431,13 +431,12 @@
     {:status 204}))
 
 (defn handle-gitlab-item-update [{:keys [payload] :as env}]
-  (let [{:keys [gitlabIssueId boardId gitlabCommit]} (:inputFields payload)
-        item-id (fetch-config [issue-created-webhook-subscription-type gitlabIssueId :item-id])
+  (let [{:keys [gitlabIssueId boardId gitlabCommit itemId]} (:inputFields payload)
         {:keys [commitTitle commitAuthorName]} gitlabCommit
         env (assoc env :gitlab-issue-id gitlabIssueId
                        :board-id boardId
                        :body (str "Commit pushed with title \"" commitTitle "\"" " by author " commitAuthorName)
-                       :item-id item-id)]
+                       :item-id itemId)]
     (try
       (create-monday-item-update env)
       (catch Exception e
